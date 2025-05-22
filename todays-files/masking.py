@@ -1,9 +1,17 @@
-# masking.py
-
 # Copyright 2025 EPFL
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# [...]
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List, Tuple, Dict, Any, Union, Optional
 import random
 from timm.models.layers import to_2tuple
@@ -20,14 +28,32 @@ class SimpleMultimodalMasking(object):
             modalities: List[str],
             vocab_sizes: List[int],
             max_seq_lens: List[int],
-            input_alphas: List[float],
-            target_alphas: List[float],
+            input_alphas: List[str],
+            target_alphas: List[str],
             input_tokens_range: Union[int, Tuple[int, int]],
             target_tokens_range: Union[int, Tuple[int, int]],
             overlap_vocab: bool = True,
             overlap_posembs: bool = True,
             include_unmasked_data_dict: bool = False,
         ):
+        """
+        Simple multimodal masking class for sampling input and target masks for each modality.
+        Operates on a dictionary of modalities, where each entry is a dictionary with 
+        a 'tokens' key containing the token tensor.
+
+        Args:
+            modalities: List of modality names
+            vocab_sizes: Vocabulary size of each modality. Used to create a unified vocabolary.
+            max_seq_lens: Maximum sequence length for each modality
+            input_alphas: List of Dirichlet alphas for the input modalities
+            target_alphas: List of Dirichlet alphas for the target modalities
+            input_tokens_range: Range of number of input tokens to sample from
+            target_tokens_range: Range of number of target tokens to sample from
+            overlap_vocab: Whether to use a unified vocabulary across modalities.
+            overlap_posembs: Whether to reuse position indices/embeddings across modalities.
+            include_unmasked_data_dict: If True, adds the unmasked data dictionary to the output
+                using the key 'unmasked_data_dict'.
+        """
         self.modalities = modalities
         self.num_modalities = len(modalities)
         self.vocab_sizes = vocab_sizes
@@ -40,164 +66,218 @@ class SimpleMultimodalMasking(object):
         self.overlap_posembs = overlap_posembs
         self.include_unmasked_data_dict = include_unmasked_data_dict
 
-        # cumulative shifts if you don't want overlap in 1D pos embeddings
         self.max_seq_len_shifts = torch.tensor(max_seq_lens).cumsum(0) - max_seq_lens[0]
 
-        # Dirichlet samplers
+        # Dirichlet sampling
         eps = 1e-9
         self.input_dirichlet = Dirichlet(torch.clamp(self.input_alphas, min=eps))
         self.target_dirichlet = Dirichlet(torch.clamp(self.target_alphas, min=eps))
-
+        
     def input_token_budget(self, num_input_tokens: int, max_tokens: torch.Tensor) -> List[int]:
-        # same as before…
-        input_budget = (self.input_dirichlet.sample() * num_input_tokens).floor().int()
-        diff = num_input_tokens - input_budget.sum()
-        input_budget += torch.bincount(
-            self.input_dirichlet.sample((diff,)).argmax(-1),
-            minlength=len(input_budget)
-        )
-        return torch.clamp(input_budget, max=max_tokens).tolist()
+        """Sample the number of input tokens for each modality, i.e. the
+        per-modality token budget.
+
+        Args:
+            num_input_tokens: Number of tokens in the input
+            max_tokens: Maximum number of tokens per modality
+
+        Returns:
+            Token budget for the input
+        """
+        # Get the number of tokens for each modality
+        input_token_budget = (self.input_dirichlet.sample() * num_input_tokens).floor().int()
+        diff = num_input_tokens - input_token_budget.sum()
+        # Adds the remaining tokens by sampling from the Dirichlet and taking the argmax
+        # This avoids adding tokens to modalities that shouldn't be sampled (i.e. with alphas ~=0)
+        input_token_budget += torch.bincount(self.input_dirichlet.sample((diff,)).argmax(dim=-1), minlength=len(input_token_budget))
+
+        # If token budget is over max tokens for a given modality, set it to max
+        input_token_budget = torch.clamp(input_token_budget, max=max_tokens)
+
+        return input_token_budget.tolist()
 
     def target_token_budget(
-            self,
-            input_token_budget: List[int],
+            self, 
+            input_token_budget: List[int], 
             num_target_tokens: int,
             max_tokens: torch.Tensor,
         ) -> List[int]:
-        # same as before…
-        max_remaining = max_tokens - torch.tensor(input_token_budget)
-        target_budget = (self.target_dirichlet.sample() * num_target_tokens).floor().int()
-        diff = num_target_tokens - target_budget.sum()
-        target_budget += torch.bincount(
-            self.target_dirichlet.sample((diff,)).argmax(-1),
-            minlength=len(target_budget)
-        )
-        return torch.clamp(target_budget, max=max_remaining).tolist()
+        """Sample the number of target tokens for each modality, i.e. the
+        per-modality token budget.
+
+        Args:
+            input_token_budget: Token budget for the input modalities
+            num_target_tokens: Number of tokens in the target
+            max_tokens: Maximum number of tokens per modality
+
+        Returns:
+            Token budget for the target
+        """
+        max_tokens_remaining = max_tokens - torch.tensor(input_token_budget)
+
+        target_token_budget = (self.target_dirichlet.sample() * num_target_tokens).floor().int()
+        diff = num_target_tokens - target_token_budget.sum()
+        # Adds the remaining tokens by sampling from the Dirichlet and taking the argmax
+        # This avoids adding tokens to modalities that shouldn't be sampled (i.e. with alphas ~=0)
+        target_token_budget += torch.bincount(self.target_dirichlet.sample((diff,)).argmax(dim=-1), minlength=len(target_token_budget))
+
+        # If token budget is over max tokens for a given modality, set it to max
+        target_token_budget = torch.clamp(target_token_budget, max=max_tokens_remaining)
+
+        return target_token_budget.tolist()
 
     def perform_random_masking(
-            self,
-            data_dict: Dict[str, Any],
-            input_token_budget: List[int],
-            target_token_budget: List[int],
-        ) -> Dict[str, Any]:
-        enc_tokens, enc_pos, enc_mods, enc_frame_pos, enc_spatial_pos = [], [], [], [], []
-        dec_tokens, dec_pos, dec_mods, dec_frame_pos, dec_spatial_pos = [], [], [], [], []
+        self, 
+        data_dict: Dict[str, Any],
+        input_token_budget: List[int],
+        target_token_budget: List[int],
+    ) -> Dict[str, Any]:
+        """
+        Applies input and target masking to a dictionary of modalities.
 
-        # for each modality, pick which positions go to encoder vs. decoder
-        for m_idx, mod in enumerate(self.modalities):
-            seq = data_dict[f"{mod}_tokens"]                      # [N]
-            N = seq.shape[0]
-            n_in = input_token_budget[m_idx]
-            n_out = target_token_budget[m_idx]
+        Args:
+            data_dict: Dictionary of modalities and the corresponding tokens
+            input_token_budget: Token budget for the input modalities
+            target_token_budget: Token budget for the target modalities
+        Returns:
+            Dictionary containing the masked modality information
+        """
+        enc_tokens, enc_positions, enc_modalities, enc_spatial_pos, enc_frame_pos = [], [], [], [], []
+        dec_tokens, dec_positions, dec_modalities, dec_spatial_pos, dec_frame_pos = [], [], [], [], []
 
-            # shuffle and split
-            shuffle_idx = torch.randperm(N)
-            in_idx  = shuffle_idx[:n_in].sort()[0]
-            out_idx = shuffle_idx[n_in:n_in+n_out].sort()[0]
+        for mod_idx, mod in enumerate(self.modalities):
+            num_tokens = data_dict[f"{mod}_tokens"].shape[0]
+            n_input_tokens = input_token_budget[mod_idx]
+            n_target_tokens = target_token_budget[mod_idx]
+            
+            # Sample input and target positions
+            noise = torch.rand(num_tokens)
+            ids_shuffle = torch.argsort(noise, dim=0)
+            input_pos = ids_shuffle[:n_input_tokens].sort()[0]
+            target_pos = ids_shuffle[n_input_tokens:n_input_tokens+n_target_tokens].sort()[0]
+            # Optionally shift the position indices such that each modality learns unique position embeddings
+            pos_idx_shift = 0 if self.overlap_posembs else self.max_seq_len_shifts[mod_idx]
+            enc_positions.append(input_pos + pos_idx_shift)
+            dec_positions.append(target_pos + pos_idx_shift)
 
-            shift = 0 if self.overlap_posembs else self.max_seq_len_shifts[m_idx]
-            enc_pos.append(in_idx + shift)
-            dec_pos.append(out_idx + shift)
+            # Get the corresponding input and target tokens
+            input_tokens = data_dict[f"{mod}_tokens"][input_pos]
+            target_tokens = data_dict[f"{mod}_tokens"][target_pos]
+            enc_tokens.append(input_tokens)
+            dec_tokens.append(target_tokens)
 
-            # tokens themselves
-            enc_tokens.append(seq[in_idx])
-            dec_tokens.append(seq[out_idx])
-
-            # modality IDs
-            enc_mods.append(m_idx * torch.ones(n_in, dtype=torch.long))
-            dec_mods.append(m_idx * torch.ones(n_out, dtype=torch.long))
-
-            # frame positions
-            fkey = f"{mod}_frame_positions"
-            if fkey in data_dict:
-                enc_frame_pos.append(data_dict[fkey][in_idx])
-                dec_frame_pos.append(data_dict[fkey][out_idx])
+            # Get the corresponding spatial positions
+            spatial_pos_key = f"{mod}_spatial_positions"
+            if spatial_pos_key in data_dict:
+                input_spatial_pos = data_dict[spatial_pos_key][input_pos]
+                target_spatial_pos = data_dict[spatial_pos_key][target_pos]
             else:
-                enc_frame_pos.append(torch.zeros(n_in, dtype=torch.long))
-                dec_frame_pos.append(torch.zeros(n_out, dtype=torch.long))
+                input_spatial_pos = torch.zeros_like(input_tokens, dtype=torch.long)
+                target_spatial_pos = torch.zeros_like(target_tokens, dtype=torch.long)
+            enc_spatial_pos.append(input_spatial_pos)
+            dec_spatial_pos.append(target_spatial_pos)
 
-            # **NEW** spatial positions
-            skey = f"{mod}_spatial_positions"
-            if skey in data_dict:
-                enc_spatial_pos.append(data_dict[skey][in_idx])
-                dec_spatial_pos.append(data_dict[skey][out_idx])
+            # Get the corresponding frame positions
+            frame_pos_key = f"{mod}_frame_positions"
+            if frame_pos_key in data_dict:
+                input_frame_pos = data_dict[frame_pos_key][input_pos]
+                target_frame_pos = data_dict[frame_pos_key][target_pos]
             else:
-                enc_spatial_pos.append(torch.zeros(n_in, dtype=torch.long))
-                dec_spatial_pos.append(torch.zeros(n_out, dtype=torch.long))
+                input_frame_pos = torch.zeros_like(input_tokens, dtype=torch.long)
+                target_frame_pos = torch.zeros_like(target_tokens, dtype=torch.long)
+            enc_frame_pos.append(input_frame_pos)
+            dec_frame_pos.append(target_frame_pos)
 
-        # concatenate across modalities
-        enc_tokens      = torch.cat(enc_tokens)
-        enc_pos         = torch.cat(enc_pos)
-        enc_mods        = torch.cat(enc_mods)
-        enc_frame_pos   = torch.cat(enc_frame_pos)
+            # In case n_input_tokens+n_target_tokens was larger than num_tokens, let's recompute 
+            # the actual number of input and target tokens
+            n_input_tokens, n_target_tokens = input_pos.shape[0], target_pos.shape[0]
+            
+            # To decide which token to predict in the encoder and decoder, we pass modality indices 
+            # that are transformed into a modality embedding
+            enc_modalities.append(mod_idx * torch.ones(n_input_tokens, dtype=torch.long))
+            dec_modalities.append(mod_idx * torch.ones(n_target_tokens, dtype=torch.long))
+                        
+        # Concatenate all lists into tensors
+        enc_tokens = torch.cat(enc_tokens)
+        dec_tokens = torch.cat(dec_tokens)
+        enc_positions = torch.cat(enc_positions)
+        dec_positions = torch.cat(dec_positions)
+        enc_modalities = torch.cat(enc_modalities)
+        dec_modalities = torch.cat(dec_modalities)
         enc_spatial_pos = torch.cat(enc_spatial_pos)
-
-        dec_tokens      = torch.cat(dec_tokens)
-        dec_pos         = torch.cat(dec_pos)
-        dec_mods        = torch.cat(dec_mods)
-        dec_frame_pos   = torch.cat(dec_frame_pos)
         dec_spatial_pos = torch.cat(dec_spatial_pos)
+        enc_frame_pos = torch.cat(enc_frame_pos)
+        dec_frame_pos = torch.cat(dec_frame_pos)
 
-        # pad out to fixed lengths
-        max_in, max_out = self.input_tokens_range[1], self.target_tokens_range[1]
-        pad_in  = max_in  - enc_tokens .shape[0]
-        pad_out = max_out - dec_tokens .shape[0]
+        # For batching, all sequences need the same length.
+        max_input_tokens, max_target_tokens = self.input_tokens_range[1], self.target_tokens_range[1]
+        enc_pad_length = max_input_tokens - enc_tokens.shape[0]
+        dec_pad_length = max_target_tokens - dec_tokens.shape[0]
+        enc_tokens = F.pad(enc_tokens, (0, enc_pad_length), mode='constant', value=0)
+        enc_positions = F.pad(enc_positions, (0, enc_pad_length), mode='constant', value=0)
+        enc_modalities = F.pad(enc_modalities, (0, enc_pad_length), mode='constant', value=0)
+        enc_spatial_pos = F.pad(enc_spatial_pos, (0, enc_pad_length), mode='constant', value=0)
+        enc_frame_pos = F.pad(enc_frame_pos, (0, enc_pad_length), mode='constant', value=0)
+        dec_tokens = F.pad(dec_tokens, (0, dec_pad_length), mode='constant', value=-100)
+        dec_positions = F.pad(dec_positions, (0, dec_pad_length), mode='constant', value=0)
+        dec_modalities = F.pad(dec_modalities, (0, dec_pad_length), mode='constant', value=0)
+        dec_spatial_pos = F.pad(dec_spatial_pos, (0, dec_pad_length), mode='constant', value=0)
+        dec_frame_pos = F.pad(dec_frame_pos, (0, dec_pad_length), mode='constant', value=0)
 
-        def _pad(x, length, val):
-            return F.pad(x, (0, length), value=val)
+        # Create attention masks for encoder and decoder
+        enc_pad_mask = torch.ones(max_input_tokens, dtype=torch.bool)
+        if enc_pad_length > 0:
+            enc_pad_mask[-enc_pad_length:] = False
+        dec_pad_mask = torch.ones(max_target_tokens, dtype=torch.bool)
+        if dec_pad_length > 0:
+            dec_pad_mask[-dec_pad_length:] = False
 
-        enc_tokens      = _pad(enc_tokens, pad_in, 0)
-        enc_pos         = _pad(enc_pos, pad_in, 0)
-        enc_mods        = _pad(enc_mods, pad_in, 0)
-        enc_frame_pos   = _pad(enc_frame_pos, pad_in, 0)
-        enc_spatial_pos = _pad(enc_spatial_pos, pad_in, 0)
-
-        dec_tokens      = _pad(dec_tokens, pad_out, -100)
-        dec_pos         = _pad(dec_pos, pad_out, 0)
-        dec_mods        = _pad(dec_mods, pad_out, 0)
-        dec_frame_pos   = _pad(dec_frame_pos, pad_out, 0)
-        dec_spatial_pos = _pad(dec_spatial_pos, pad_out, 0)
-
-        # build pad masks
-        enc_pad_mask = torch.ones(max_in,  dtype=torch.bool)
-        enc_pad_mask[-pad_in:] = False
-        dec_pad_mask = torch.ones(max_out, dtype=torch.bool)
-        dec_pad_mask[-pad_out:] = False
-
-        return {
-            'enc_tokens':           enc_tokens,
-            'enc_positions':        enc_pos,
-            'enc_modalities':       enc_mods,
-            'enc_frame_positions':  enc_frame_pos,
-            'enc_spatial_positions':enc_spatial_pos,   # ? new
-            'enc_pad_mask':         enc_pad_mask,
-
-            'dec_tokens':           dec_tokens,
-            'dec_positions':        dec_pos,
-            'dec_modalities':       dec_mods,
-            'dec_frame_positions':  dec_frame_pos,
-            'dec_spatial_positions':dec_spatial_pos,   # ? new
-            'dec_pad_mask':         dec_pad_mask,
+        masked_data_dict = {
+            'enc_tokens': enc_tokens,
+            'enc_positions': enc_positions,
+            'enc_modalities': enc_modalities,
+            'enc_spatial_positions': enc_spatial_pos,
+            'enc_frame_positions': enc_frame_pos,
+            'enc_pad_mask': enc_pad_mask,
+            'dec_tokens': dec_tokens,
+            'dec_positions': dec_positions,
+            'dec_modalities': dec_modalities,
+            'dec_spatial_positions': dec_spatial_pos,
+            'dec_frame_positions': dec_frame_pos,
+            'dec_pad_mask': dec_pad_mask,
         }
 
+        return masked_data_dict
+
     def __call__(self, data_dict):
-        # optionally unify vocab
+        """Applies input and target masking to a dictionary of modalities
+
+        Args:
+            data_dict: Dictionary of modalities
+
+        Returns:
+            Dictionary containing the masked modalities
+        """
         if not self.overlap_vocab:
-            data_dict = to_unified_multimodal_vocab(
-                data_dict, self.modalities, self.vocab_sizes
-            )
+            # Unify the vocabulary for all modalities, making sure the indices for each modality 
+            # are non-overlapping with other modalities.
+            data_dict = to_unified_multimodal_vocab(data_dict, self.modalities, self.vocab_sizes)
 
+        # Get maximum number of tokens for each modality
         max_tokens = torch.tensor(self.max_seq_lens)
-        num_in  = random.randint(*self.input_tokens_range)
-        num_out = random.randint(*self.target_tokens_range)
-
-        in_budget  = self.input_token_budget(num_in,  max_tokens)
-        out_budget = self.target_token_budget(in_budget, num_out, max_tokens)
-
-        masked = self.perform_random_masking(data_dict, in_budget, out_budget)
+        
+        # Sample number of input and target tokens
+        num_input_tokens = random.randint(*self.input_tokens_range)
+        num_target_tokens = random.randint(*self.target_tokens_range)
+        
+        # Get input and target per-modality token budgets
+        input_token_budget = self.input_token_budget(num_input_tokens, max_tokens)
+        target_token_budget = self.target_token_budget(input_token_budget, num_target_tokens, max_tokens)
+            
+        # Apply input and target masking
+        masked_data_dict = self.perform_random_masking(data_dict, input_token_budget, target_token_budget)
 
         if self.include_unmasked_data_dict:
-            masked['unmasked_data_dict'] = data_dict
-
-        return masked
-
+            masked_data_dict['unmasked_data_dict'] = data_dict
+            
+        return masked_data_dict
