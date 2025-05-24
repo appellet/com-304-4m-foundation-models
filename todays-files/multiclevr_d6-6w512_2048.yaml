@@ -5,14 +5,14 @@ output_dir: /work/com-304/IAY_neurons_u2/outputs-of-training-all--datasetsamples
 
 # Global variables used throughout the config
 global_vars:
-  batch_size: 8 # per GPU (512 global batch size) a voir 128!!!
+  batch_size: 4 # per GPU (512 global batch size) a voir 128!!!
   modalities: ["rgb", "pose", "caption"] # Input and output modalities
   vocab_sizes: [64000, 64000, 50304] # Vocab sizes for each modality
-  max_seq_lens: [4352, 4352, 1024] # Max sequence lengths for each modality
+  max_seq_lens: [4352, 4352, 2048] # Max sequence lengths for each modality
   input_alphas: [1.0, 1.0, 1.0] # Input dirichlet alpha values for each modality
   target_alphas: [1.0, 1.0, 1.0] # Target dirichlet alpha values for each modality
-  input_tokens_range: [1, 512] # Min and max encoder tokens during training
-  target_tokens_range: [1, 512] # Min and max decoder tokens during training
+  input_tokens_range: [1, 1024] # Min and max encoder tokens during training
+  target_tokens_range: [1, 1024] # Min and max decoder tokens during training
 
 # Training
 batch_size: ${global_vars.batch_size}
@@ -75,7 +75,7 @@ train_loader_config:
   target_tokens_range: ${global_vars.target_tokens_range}
   sample_from_k_augmentations: 10
   text_tokenizer_path: gpt2
-  text_max_length: 1024
+  text_max_length: 2048
   batch_size: ${global_vars.batch_size}
   infinite: True
   num_workers: 10
@@ -100,7 +100,7 @@ eval_loader_config:
   input_tokens_range: ${global_vars.input_tokens_range}
   target_tokens_range: ${global_vars.target_tokens_range}
   text_tokenizer_path: gpt2
-  text_max_length: 1024
+  text_max_length: 2048
   batch_size: ${global_vars.batch_size}
   num_workers: 10
   pin_memory: True

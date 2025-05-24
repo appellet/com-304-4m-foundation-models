@@ -172,8 +172,8 @@ class SimpleMultimodalMasking(object):
                 input_spatial_pos = data_dict[spatial_pos_key][input_pos]
                 target_spatial_pos = data_dict[spatial_pos_key][target_pos]
             else:
-                input_spatial_pos = torch.zeros_like(input_tokens, dtype=torch.long)
-                target_spatial_pos = torch.zeros_like(target_tokens, dtype=torch.long)
+                print(f"Error in spatial pos key in masking.py line 175 : {e}")
+            
             enc_spatial_pos.append(input_spatial_pos)
             dec_spatial_pos.append(target_spatial_pos)
 
@@ -183,8 +183,8 @@ class SimpleMultimodalMasking(object):
                 input_frame_pos = data_dict[frame_pos_key][input_pos]
                 target_frame_pos = data_dict[frame_pos_key][target_pos]
             else:
-                input_frame_pos = torch.zeros_like(input_tokens, dtype=torch.long)
-                target_frame_pos = torch.zeros_like(target_tokens, dtype=torch.long)
+                print(f"Error during frame pos key in masking.py line 186 : {e}")
+            
             enc_frame_pos.append(input_frame_pos)
             dec_frame_pos.append(target_frame_pos)
 
@@ -220,7 +220,7 @@ class SimpleMultimodalMasking(object):
         enc_frame_pos = F.pad(enc_frame_pos, (0, enc_pad_length), mode='constant', value=0)
         dec_tokens = F.pad(dec_tokens, (0, dec_pad_length), mode='constant', value=-100)
         dec_positions = F.pad(dec_positions, (0, dec_pad_length), mode='constant', value=0)
-        dec_modalities = F.pad(dec_modalities, (0, dec_pad_length), mode='constant', value=0)
+        dec_modalities = F.pad(dec_modalities, (0, dec_pad_length), mode='constant', value=0) # on ajouter les 0 pour le padding
         dec_spatial_pos = F.pad(dec_spatial_pos, (0, dec_pad_length), mode='constant', value=0)
         dec_frame_pos = F.pad(dec_frame_pos, (0, dec_pad_length), mode='constant', value=0)
 

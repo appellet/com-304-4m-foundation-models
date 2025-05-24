@@ -10,6 +10,10 @@ from nanofm.modeling.transformer_layers import TransformerTrunk, TransformerDeco
 from nanofm.utils.sampling import sample_tokens
 
 
+#import os
+#os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
+
 def build_1d_sincos_posemb(max_len, embed_dim=1024, temperature=10000.):
     """Sine-cosine positional embeddings from MoCo-v3, adapted back to 1d.
     Returns positional embedding of shape (N, D)
@@ -146,8 +150,8 @@ class FourM(nn.Module):
     def initialize_weights(self) -> None:
         """Initialize the weights of the model."""
         self.apply(self._init_weights)
-        nn.init.constant_(self.to_logits.weight, 0)
-
+        nn.init.constant_(self.to_logits.weight, 0.1)
+        
     def _init_weights(self, module) -> None:
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=self.init_std)
@@ -166,8 +170,8 @@ class FourM(nn.Module):
             n_params -= self.enc_mod_emb.weight.numel()
             n_params -= self.dec_mod_emb.weight.numel()
             n_params -= self.to_logits.weight.numel()
-            n_params -= self.frame_pos_emb.weight.numel()
-            n_params -= self.spatial_pos_emb.weight.numel()  # Subtract spatial embedding params
+            #n_params -= self.frame_pos_emb.weight.numel()
+            #n_params -= self.spatial_pos_emb.weight.numel()  # Subtract spatial embedding params
         return n_params
 
     def forward_encoder(
@@ -389,57 +393,85 @@ class FourM(nn.Module):
         enc_input_positions: torch.LongTensor,
         enc_input_modalities: torch.LongTensor,
         enc_frame_positions: torch.LongTensor,
-        enc_spatial_positions: torch.LongTensor,  # [1, N_input]
+        enc_spatial_positions: torch.LongTensor,
         target_mod: str,
         num_steps: int = 8,
         temp: float = 1.0,
         top_p: float = 0.0,
         top_k: float = 0.0,
-    ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor]:
+        ) -> Tuple[torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor]:
         """
-        Generate one modality through iterative unmasking using the Random Order Auto Regressive (ROAR) decoding scheme.
+            Generate one modality through iterative unmasking using the Random Order Auto Regressive (ROAR) decoding scheme.
         """
         B, N = enc_input_tokens.shape
         assert B == 1
         device = enc_input_tokens.device
+        print(f"Device: {device}")
+    
         target_mod_index = self.modalities.index(target_mod)
         n_tokens_target = self.max_seq_lens[target_mod_index]
-
+        print(f"target_mod: {target_mod}, target_mod_index: {target_mod_index}, n_tokens_target: {n_tokens_target}")
+    
         # Get schedule for unmasking tokens
         schedule = self.get_unmasking_schedule(n_tokens_target, num_steps)
-
+        print(f"schedule: {schedule}")
+    
         # Randomly shuffle positions from 0 to n_tokens_target - 1
         positions_order = np.random.permutation(n_tokens_target)
         indices = np.cumsum(schedule, axis=-1)[:-1]
-        dec_input_positions_list = [torch.from_numpy(np.reshape(positions, (1, -1))) for positions in np.array_split(positions_order, indices, axis=-1)]
-
+        dec_input_positions_list = [torch.from_numpy(np.reshape(positions, (1, -1))) for positions in
+                                    np.array_split(positions_order, indices, axis=-1)]
+        print(f'dec_input_positions_list : {dec_input_positions_list}')
         # Initialize spatial and frame positions for the target modality
-        # Assuming spatial positions are for a 16x16 grid, repeated per frame
-        max_frames = 17  # From frame_pos_emb
-        tokens_per_frame = 256  # 16x16 grid
+        print(device)
+        max_frames = 17
+        tokens_per_frame = 256
         dec_spatial_positions_list = []
         dec_frame_positions_list = []
         for step, k in enumerate(schedule):
-            positions = dec_input_positions_list[step]  # Shape: [1, k]
-            # Compute frame and spatial indices
-            frame_indices = (positions // tokens_per_frame).to(torch.long)  # Frame index per token
-            spatial_indices = (positions % tokens_per_frame).to(torch.long)  # Spatial index within frame
+            positions = dec_input_positions_list[step]
+            print(positions)
+            frame_indices = (positions // tokens_per_frame)
+            spatial_indices = (positions % tokens_per_frame)
             dec_frame_positions_list.append(frame_indices)
             dec_spatial_positions_list.append(spatial_indices)
-
+        enc_frame_positions   = enc_frame_positions.unsqueeze(0)
+        enc_spatial_positions = enc_spatial_positions.unsqueeze(0)
         for step, k in enumerate(schedule):
-            # Select the k positions to predict for this step
-            dec_input_positions = dec_input_positions_list[step].to(device)  # Shape: [1, k]
-            dec_frame_positions = dec_frame_positions_list[step].to(device)  # Shape: [1, k]
-            dec_spatial_positions = dec_spatial_positions_list[step].to(device)  # Shape: [1, k]
-
-            # Create a tensor of k IDs specifying the target modality
-            dec_input_modalities = target_mod_index * torch.ones(1, k, dtype=torch.long, device=device)
-
+            dec_input_positions = dec_input_positions_list[step]
+            dec_frame_positions = dec_frame_positions_list[step]
+            dec_spatial_positions = dec_spatial_positions_list[step]
+    
+            dec_input_modalities = target_mod_index * torch.ones(1, k, dtype=torch.long )
+            print(f"dec_input_modalities shape: {dec_input_modalities.shape}, device: {dec_input_modalities.device}")
+    
             # Compute padding masks
-            enc_pad_mask = enc_input_tokens != self.padding_idx  # Shape: [1, N]
-            dec_pad_mask = torch.ones_like(dec_input_modalities, device=device, dtype=torch.bool)  # Shape: [1, k]
-
+            enc_pad_mask = enc_input_tokens != self.padding_idx  # Use self.padding_idx directly
+            dec_pad_mask = torch.ones_like(dec_input_modalities,  dtype=torch.bool)
+            
+            # print(enc_input_tokens.device)
+            # print(enc_input_modalities.device)
+            # print(enc_input_positions.device)
+            # print(enc_frame_positions.device)
+            # print(enc_spatial_positions.device)
+            # print(dec_input_modalities.device)
+            # print(dec_input_positions.device)
+            # print(dec_frame_positions.device)
+            # print(dec_spatial_positions.device)
+            # print(enc_pad_mask.device)
+            # print(dec_pad_mask.device)
+            print(f'the enc tokens: {enc_input_tokens}')
+            print(f'the enc modalities: {enc_input_modalities}')
+            print(f'the enc positions: {enc_input_positions}')
+            print(f'the enc frame positions: {enc_frame_positions}')
+            print(f'the enc  spatial positions: {enc_spatial_positions}')
+            print(f'the decoder modalities: {dec_input_modalities.to(device)}')
+            print(f'the decoder positions: {dec_input_positions.to(device)}')
+            print(f'the decoder frame positions: {dec_frame_positions.to(device)}')
+            print(f'the decoder spatial positions: {dec_spatial_positions.to(device)}')
+            print(f'the enc padding mask: {enc_pad_mask}')
+            print(f'the decoder padding mask: {dec_pad_mask.to(device)}')
+            
             # Forward pass through the model
             predicted_logits = self.forward_model(
                 enc_input_tokens,
@@ -447,27 +479,30 @@ class FourM(nn.Module):
                 enc_input_positions,
                 enc_frame_positions,
                 enc_spatial_positions,
-                dec_input_modalities,
-                dec_input_positions,
-                dec_frame_positions,
-                dec_spatial_positions,
+                dec_input_modalities.to(device),
+                dec_input_positions.to(device),
+                dec_frame_positions.to(device),
+                dec_spatial_positions.to(device),
                 enc_pad_mask=enc_pad_mask,
-                dec_pad_mask=dec_pad_mask,
-            )[0]  # Shape: [k, vocab_size]
-
+                dec_pad_mask=dec_pad_mask.to(device),
+            )[0]
+            
             # Sample new tokens
             samples, _ = sample_tokens(predicted_logits, temp, top_k, top_p)
-
+    
             # Concatenate new tokens to encoder inputs
-            enc_input_tokens = torch.cat([enc_input_tokens, samples.unsqueeze(0)], dim=1)  # Shape: [1, N_prev + k]
-            enc_input_positions = torch.cat([enc_input_positions, dec_input_positions], dim=1)  # Shape: [1, N_prev + k]
-            enc_input_modalities = torch.cat([enc_input_modalities, dec_input_modalities], dim=1)  # Shape: [1, N_prev + k]
-            enc_frame_positions = torch.cat([enc_frame_positions, dec_frame_positions], dim=1)  # Shape: [1, N_prev + k]
-            enc_spatial_positions = torch.cat([enc_spatial_positions, dec_spatial_positions], dim=1)  # Shape: [1, N_prev + k]
-
+            enc_input_tokens = torch.cat([enc_input_tokens, samples.unsqueeze(0)], dim=1)
+            enc_input_positions = torch.cat([enc_input_positions, dec_input_positions.to(device)], dim=1)
+            enc_input_modalities = torch.cat([enc_input_modalities, dec_input_modalities.to(device)], dim=1)
+            enc_frame_positions = torch.cat([enc_frame_positions, dec_frame_positions.to(device)], dim=1)
+            enc_spatial_positions = torch.cat([enc_spatial_positions, dec_spatial_positions.to(device)], dim=1)
+    
         # Select and unshuffle predicted tokens
-        pred_tokens = enc_input_tokens[:, enc_input_modalities == target_mod_index]
-        indices = enc_input_positions[:, enc_input_modalities == target_mod_index]
+        print(enc_input_tokens.squeeze(0).shape)
+        print(enc_input_modalities.squeeze(0).shape)
+        print(enc_input_modalities == target_mod_index)
+        pred_tokens = enc_input_tokens.squeeze(0)[ (enc_input_modalities == target_mod_index)[0]]
+        indices = enc_input_positions.squeeze(0)[ (enc_input_modalities == target_mod_index)[0]]
         pred_tokens = pred_tokens[indices.argsort()].unsqueeze(0)
-
+    
         return pred_tokens, enc_input_tokens, enc_input_positions, enc_input_modalities, enc_frame_positions, enc_spatial_positions
