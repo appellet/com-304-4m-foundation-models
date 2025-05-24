@@ -1,7 +1,7 @@
 # Designed to be run on 4xV100-32GB GPUs
 
 run_name: auto # Auto-generate a run name
-output_dir: /work/com-304/IAY_neurons_u2/outputs-of-training-all--datasetsampleschangeinit-changepersaple1024-all/outputs/auto # Set to auto to use the run_name
+output_dir: /work/com-304/IAY_neurons_u2/outputs-of-training-all--datasetsampleschangeinit-changepersaple2048-all/outputs/auto # Set to auto to use the run_name
 
 # Global variables used throughout the config
 global_vars:
